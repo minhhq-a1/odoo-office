@@ -4,17 +4,17 @@
 - Môi trường: Node 24.11.1, pnpm 9.15.4 (`pnpm install --no-frozen-lockfile` vì lockfile lệch cấu hình `patchedDependencies`), PostgreSQL 16 ngoài (`DATABASE_URL`), chế độ `local_trusted`, tắt telemetry (`PAPERCLIP_TELEMETRY_DISABLED=1`). Lệnh khởi động: [`round2/run.sh`](round2/run.sh).
 - Agent giả lập: adapter `process` chạy [`round2/fake_agent.py`](round2/fake_agent.py). Script tự chọn ticket trong inbox, checkout, báo cost event 3 cent, ghi một dòng "side effect" ra file, rồi chuyển ticket sang `done` kèm comment.
 - Log đầy đủ (lệnh curl và phản hồi): [`round2/evidence.log`](round2/evidence.log).
-- **Agent thật `claude_local` chưa chạy**: container không có `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` (chỉ có `ANTHROPIC_BASE_URL` mặc định `https://api.anthropic.com`).
+- Container không có sẵn `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`. Sau đó anh Max cấp một **gateway tương thích Anthropic của bên thứ ba** (không phải Anthropic trực tiếp; model dạng `kr/claude-haiku-4.5`), dùng cho phép thử F bên dưới. Key chỉ nằm trong env của adapter trong container, không ghi vào repo.
 
 ## Bảng kết quả
 
 | Tiêu chí | Luồng bình thường | Tình huống lỗi | Ghi chú |
 |---|---|---|---|
-| Tích hợp agent | **Đạt** (giả lập) | **Đạt có điều kiện** | Xem mục "Restart/kill". Adapter `process` không tự cấp `PAPERCLIP_TASK_ID`, agent phải tự lấy từ inbox. Agent thật chưa chạy được. |
+| Tích hợp agent | **Đạt** (giả lập và `claude_local` thật) | **Đạt có điều kiện** | Xem mục "Restart/kill". Adapter `process` không tự cấp `PAPERCLIP_TASK_ID`, agent phải tự lấy từ inbox. Agent thật chưa chạy được. |
 | Phê duyệt | **Đạt** | **Đạt** | Stage `approval` do runtime cưỡng chế; phê duyệt thiếu comment bị từ chối. |
 | Giới hạn chi phí | **Đạt** | **Đạt**, có rủi ro vận hành | Hard stop cắt cả lượt đang chạy; `reservationCents` chặn trước khi chạy. Sau khi server bị kill cứng, agent kẹt ở trạng thái pause, không mở lại được qua API. |
 | Lưu vết | **Đạt** | **Đạt có điều kiện** | Activity log nối được ticket, run, output, người duyệt. Cost event chỉ gắn với run khi body có `heartbeatRunId`; header `X-Paperclip-Run-Id` không đủ. |
-| Đối chiếu chi phí với provider | Chưa chạy | Chưa chạy | Cần API key. Paperclip có sẵn `POST /companies/{id}/accounting/provider-costs/import` (provider `anthropic`/`openai`, theo ngày UTC) để nhập chi phí từ provider, cần secret riêng. |
+| Đối chiếu chi phí với provider | **Không đạt** trên gateway này | Không đạt | Số tiền Paperclip ghi là số do Claude CLI tự tính, không khớp bảng giá công khai, và gateway không có nguồn chi phí để đối chiếu. Xem phép thử F. |
 
 ## Chi tiết từng phép thử
 
@@ -57,10 +57,26 @@ Budget agent 10 cent, mỗi lượt 3 cent, các ticket chạy tuần tự:
 - Kết luận: trong 3 phép thử **không thấy chạy trùng**. Bản này không tự retry sau restart như tài liệu vòng 1 dự đoán; thay vào đó ticket bị `blocked` chờ người xử lý. Rủi ro thật nằm ở chỗ khác: (1) process mồ côi sau `SIGKILL` vẫn tiếp tục ghi vào hệ thống, nên nếu người vận hành mở lại ticket bị `blocked` trong lúc process cũ còn sống thì sẽ chạy trùng; (2) trạng thái run và budget bị kẹt, cần can thiệp DB hoặc tạo agent mới.
 - Biện pháp cho pilot: chạy server dưới process manager dừng bằng SIGTERM (không kill -9), giết cả process group của agent khi restart, và trước khi mở lại ticket `blocked` phải kiểm tra không còn process agent nào đang chạy.
 
+### F. Agent thật `claude_local` qua gateway (1 ticket)
+- Agent `claude_local`, model `kr/claude-haiku-4.5`, `ANTHROPIC_BASE_URL=https://9r.m4x.id.vn` (không có `/v1`, CLI tự thêm), key đặt trong `adapterConfig.env`. Ticket T11: viết checklist UAT 5 dòng cho `stock.picking`.
+- Tích hợp **đạt**: run 1 `succeeded` sau khoảng 40 giây, agent đăng comment checklist đúng yêu cầu.
+- **Run thứ hai tự phát sinh**: run 1 đăng comment nhưng không đóng ticket, nên Paperclip tự chạy thêm run `issue_disposition_repair` (`retryOfRunId` trỏ về run 1) để đóng ticket. Đó là một lượt model trả tiền thêm, tốn hơn run đầu. Với agent có side effect thật thì đây là đường chạy lặp cần chặn (agent phải tự idempotent, hoặc prompt buộc đóng ticket).
+- Chi phí Paperclip ghi (bảng `cost_events`, `billing_type = metered_api`, `cost_status = reported`, `reported_cost_cents` = `cost_cents`):
+
+| Run | Input token | Output token | Chi phí ghi nhận |
+|---|---|---|---|
+| 1 | 139.626 | 363 | 61,03 cent |
+| 2 (repair) | 244.852 | 406 | 98,75 cent |
+
+- Số tiền là số **do Claude CLI báo** (`reported` bằng `cost_cents`), Paperclip không tự định giá. Theo giá công khai của Haiku 4.5 (1 USD / 5 USD mỗi triệu token) thì run 1 khoảng 14 cent, nên số ghi nhận **cao gấp khoảng 4 lần**. Nguyên nhân (CLI không biết tên model `kr/...` nên dùng bảng giá mặc định) là suy đoán, chưa kiểm chứng.
+- Số input token cũng đáng ngờ: một request "Say ok" gọi thẳng gateway báo `input_tokens = 6517`, nên gateway có vẻ cộng thêm prompt hệ thống riêng.
+- Em không tìm thấy trang usage hay API chi phí của gateway, nên **không đối soát được** với phía provider. Hệ quả cho pilot: budget Paperclip trên gateway dạng này chỉ là ước lượng; lớp chặn cứng (lớp 1 trong `cost-cap-check.md`) phải đặt ở chính gateway, hoặc dùng Anthropic trực tiếp.
+
 ## Quan sát khác
 - Lượt chạy T1 làm xong việc nhưng heartbeat run hiển thị `cancelled` ("Cancelled before issue reassignment"), vì runtime chuyển ticket sang người duyệt. Trạng thái run không phản ánh đúng kết quả, nên báo cáo phải đọc theo ticket.
 - Lượt chạy đầu tiên không tìm được ticket nên ticket bị recovery chuyển sang `blocked`. Agent tự viết phải tự checkout ticket.
 
 ## Việc còn lại
-1. Chạy 1–2 ticket với `claude_local` khi container có API key, rồi đối chiếu `costs/by-agent` với Usage/Cost trên Console (hoặc import qua `accounting/provider-costs/import`, cần Admin API key).
-2. Thử agent tự phê duyệt (cần tạo agent key) và luồng `changes_requested`.
+1. Xác định gateway có trang usage/chi phí hay hạn mức theo key không; nếu có, so lại cho 2 run của T11. Nếu không, pilot dùng Anthropic trực tiếp (workspace riêng, spend limit, import qua `accounting/provider-costs/import` bằng Admin API key).
+2. Thử agent tự phê duyệt bằng token của chính nó (cần tạo agent key) và luồng `changes_requested`.
+3. Chọn cách chặn run `issue_disposition_repair` khi agent không đóng ticket.
