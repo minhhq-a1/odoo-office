@@ -19,7 +19,10 @@ task = os.environ.get("PAPERCLIP_TASK_ID")
 if not task:  # process adapter does not inject PAPERCLIP_TASK_ID: pick from inbox
     st, rows = call("GET", f"/api/companies/{me['companyId']}/issues?assigneeAgentId={me['id']}&status=todo,in_progress,blocked")
     task = rows[0]["id"] if isinstance(rows, list) and rows else None
-    if task: print("checkout", call("POST", f"/api/issues/{task}/checkout", {"agentId": me["id"], "expectedStatuses": ["todo", "in_progress", "blocked"]}), flush=True)
+    if task:
+        st, body = call("POST", f"/api/issues/{task}/checkout", {"agentId": me["id"], "expectedStatuses": ["todo", "in_progress", "blocked"]})
+        print("checkout", st, flush=True)
+        if st != 200: sys.exit(0)  # 409 = another run owns it; never retry, no cost/side effect
 print("run", run, "agent", me.get("id") if isinstance(me, dict) else me, "task", task, flush=True)
 log.write(f"{time.time():.0f} START run={run} task={task}\n"); log.flush()
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
